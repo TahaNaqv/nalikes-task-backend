@@ -1,4 +1,5 @@
 const sessionService = require('../services/session.service');
+const BroadcastService = require('../services/broadcast.service');
 const { HTTP_STATUS } = require('../utils/constants');
 
 // Create session
@@ -94,12 +95,23 @@ exports.endSession = async (req, res, next) => {
     const { sessionId } = req.params;
     const userId = req.userId;
     
-    const session = await sessionService.endSession(sessionId, userId);
+    // Get broadcast service if io is available
+    let broadcastService = null;
+    if (req.app.locals.io) {
+      broadcastService = new BroadcastService(req.app.locals.io);
+    }
+    
+    // Use new endSessionAndProcessRewards method
+    const result = await sessionService.endSessionAndProcessRewards(
+      sessionId,
+      userId,
+      broadcastService
+    );
     
     res.status(HTTP_STATUS.OK).json({
       success: true,
-      data: session,
-      message: 'Session ended successfully'
+      data: result,
+      message: 'Session ended successfully. Winner determined and token awarded.'
     });
   } catch (error) {
     next(error);

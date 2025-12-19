@@ -3,6 +3,8 @@ const PlayerSession = require('../models/PlayerSession');
 const User = require('../models/User');
 const { NotFoundError, ConflictError, ValidationError, AuthorizationError } = require('../utils/errors');
 const { SESSION_STATUS, DEFAULTS, ERROR_CODES } = require('../utils/constants');
+const scoringService = require('./scoring.service');
+const blockchainService = require('./blockchain.service');
 const mongoose = require('mongoose');
 
 class SessionService {
@@ -219,6 +221,94 @@ class SessionService {
     const updatedSession = await this.getSession(session._id);
 
     return updatedSession;
+  }
+
+  // End session and process rewards
+  async endSessionAndProcessRewards(sessionId, userId, broadcastService = null) {
+    // Get session
+    const session = await this.findSessionById(sessionId);
+
+    if (!session) {
+      throw new NotFoundError('Session');
+    }
+
+    // Verify user is creator (if userId provided, otherwise allow system/auto-end)
+    if (userId && session.creatorId.toString() !== userId.toString()) {
+      throw new AuthorizationError('Only session creator can end the session');
+    }
+
+    // Check if already ended
+    if (session.status === SESSION_STATUS.ENDED || session.status === SESSION_STATUS.CANCELLED) {
+      throw new ConflictError('Session is already ended');
+    }
+
+    // End session
+    await session.end();
+
+    // Calculate winner
+    const winner = await scoringService.calculateWinner(session._id);
+
+    // Get final leaderboard
+    const leaderboard = await scoringService.getFinalLeaderboard(session._id);
+
+    // Award token to winner if exists
+    let rewardData = null;
+    if (winner) {
+      try {
+        // Get winner userId (handle both ObjectId and populated object)
+        const winnerUserId = winner.userId._id || winner.userId;
+        
+        rewardData = await blockchainService.awardToken(session._id, winnerUserId, null);
+        
+        // Update user's sessions won count
+        const winnerUser = await User.findById(winnerUserId);
+        if (winnerUser) {
+          await winnerUser.incrementSessionsWon();
+        }
+      } catch (error) {
+        console.error('Error awarding token:', error);
+        // Continue even if token award fails - reward will be in PENDING status
+        rewardData = {
+          status: 'PENDING',
+          error: error.message
+        };
+      }
+    }
+
+    // Get updated session
+    const updatedSession = await this.getSession(session._id);
+
+    // Broadcast events if broadcast service provided
+    if (broadcastService) {
+      broadcastService.notifySessionEnded(
+        session.sessionId,
+        updatedSession,
+        winner,
+        leaderboard
+      );
+
+      if (rewardData && rewardData.transactionHash) {
+        const winnerUserId = winner.userId._id || winner.userId;
+        broadcastService.notifyTokenRewarded(
+          session.sessionId,
+          winnerUserId,
+          rewardData
+        );
+      }
+    }
+
+    return {
+      session: updatedSession,
+      winner: winner ? {
+        userId: winner.userId,
+        username: winner.username,
+        walletAddress: winner.walletAddress,
+        score: winner.score,
+        tasksCompleted: winner.tasksCompleted
+      } : null,
+      leaderboard,
+      reward: rewardData
+    };
   }
 
   // Get leaderboard
